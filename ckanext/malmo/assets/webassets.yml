@@ -1,0 +1,4 @@
+styles:
+  output: styles/malmo_style.css
+  contents:
+  - css/style.css

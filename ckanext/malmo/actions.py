@@ -1,0 +1,344 @@
+'''API functions for adding data to CKAN.'''
+from __future__ import annotations
+
+import logging
+import markdown
+import html2text
+import json
+from pprint import pformat
+from typing import Any
+
+import ckan
+from ckan.common import config, asbool, _
+import ckan.logic.validators
+import ckan.lib.datapreview
+import ckan.lib.dictization
+import ckan.logic as logic
+import ckan.logic.action
+import ckan.logic.schema
+import ckan.lib.dictization.model_dictize as model_dictize
+import ckan.lib.navl.dictization_functions
+import ckan.plugins as plugins
+import ckan.lib.plugins as lib_plugins
+from ckan.types import ActionResult, Context, DataDict, Schema
+
+
+log = logging.getLogger(__name__)
+
+# Define some shortcuts
+# Ensure they are module-private so that they don't get loaded as available
+# actions in the action API.
+_get_action = logic.get_action
+_check_access = logic.check_access
+_get_or_bust = logic.get_or_bust
+ValidationError = logic.ValidationError
+NotFound = logic.NotFound
+NotAuthorized = logic.NotAuthorized
+fresh_context = logic.fresh_context
+
+
+log = logging.getLogger(__name__)
+
+
+DATASET_FIELDS = [
+    "title",
+    "notes",
+]
+RESOURCE_FIELDS = [
+    "name",
+    "description",
+]
+GROUP_ORG_FIELDS = [
+    "title",
+    "description",
+    "display_name",
+]
+
+
+def _translate_fields(context, data_dict, fields_to_translate=["title", "notes"], translate_resources=True):
+    html_convert = html2text.HTML2Text()
+    default_lang = config.get("ckan.locale_default", "sv").split("_")[0]
+
+    for field in fields_to_translate:
+        val = data_dict.get(field, "")
+        data_dict["{}_translated-{}".format(field, default_lang)] = val
+
+    languages_offered = config.get("ckan.locales_offered", ["sv", "en"])
+    languages = [lang.split("_")[0] for lang in languages_offered if lang != default_lang]
+
+    for lang in languages:
+        try:
+            translation_input = {
+                f: (markdown.markdown(data_dict.get(f, "")) if f == "notes" else data_dict.get(f, ""))
+                for f in fields_to_translate
+            }
+
+            translation = _get_action("translate")(
+                context,
+                {
+                    "input": translation_input,
+                    "from": default_lang,
+                    "to": lang,
+                },
+            )
+
+            outputs = translation.get("output", {})
+
+            for field in fields_to_translate:
+                translated_val = outputs.get(field, "")
+
+                if translated_val:
+                    translated_val = translated_val.strip("\n")
+
+                if field == "notes":
+                    translated_val = html_convert.handle(translated_val)
+
+                data_dict["{}_translated-{}".format(field, lang)] = translated_val
+
+        except Exception as e:
+            log.debug("Unable to retrieve {} translation for {}: {}".format(
+                lang, data_dict.get("name"), e
+            ))
+
+            for field in fields_to_translate:
+                data_dict["{}_translated-{}".format(field, lang)] = data_dict.get(field, "")
+
+    for field in fields_to_translate:
+        existing_translations = data_dict.get("{}_translated".format(field))
+
+        if isinstance(existing_translations, dict):
+            for lang in existing_translations.keys():
+                flat_key = "{}_translated-{}".format(field, lang)
+                if flat_key in data_dict:
+                    data_dict["{}_translated".format(field)][lang] = data_dict[flat_key]
+
+    data_dict = _format_translated_fields(data_dict)
+
+    if translate_resources and 'resources' in data_dict:
+        data_dict = _translate_resources(context, data_dict)
+
+    return data_dict
+
+def _group_translate(data_dict):
+    data_dict = _format_translated_fields(data_dict)
+    group_title = data_dict.get("title_translated")
+
+    if group_title:
+        data_dict["display_name_translated"] = group_title
+
+    for field in GROUP_ORG_FIELDS:
+        key = f"{field}_translated"
+        translated_field = data_dict.get(key)
+
+        if translated_field and isinstance(translated_field, str):
+            try:
+                data_dict[key] = json.loads(translated_field)
+            except (json.JSONDecodeError, TypeError):
+                log.error(f"Unable to decode JSON for {key}: {translated_field}")
+                data_dict[key] = {}
+
+    return data_dict
+
+def _group_or_org_show(
+        context: Context, data_dict: DataDict,
+        is_org: bool = False) -> dict[str, Any]:
+    model = context['model']
+    id = _get_or_bust(data_dict, 'id')
+
+    group = model.Group.get(id)
+
+    if asbool(data_dict.get('include_datasets', False)):
+        packages_field = 'datasets'
+    elif asbool(data_dict.get('include_dataset_count', True)):
+        packages_field = 'dataset_count'
+    else:
+        packages_field = None
+
+    try:
+        include_tags = asbool(data_dict.get('include_tags', True))
+        if config.get('ckan.auth.public_user_details'):
+            include_users = asbool(data_dict.get('include_users', True))
+        else:
+            include_users = asbool(data_dict.get('include_users', False))
+        include_groups = asbool(data_dict.get('include_groups', True))
+        include_extras = asbool(data_dict.get('include_extras', True))
+        include_followers = asbool(data_dict.get('include_followers', True))
+        include_member_count = asbool(data_dict.get('include_member_count', False))
+    except ValueError:
+        raise logic.ValidationError({
+            'message': _('Parameter is not an bool')
+        })
+
+    if group is None:
+        raise NotFound
+    if is_org and not group.is_organization:
+        raise NotFound
+    if not is_org and group.is_organization:
+        raise NotFound
+
+    context['group'] = group
+
+    if is_org:
+        _check_access('organization_show', context, data_dict)
+    else:
+        _check_access('group_show', context, data_dict)
+
+    group_dict = model_dictize.group_dictize(group, context,
+                                             packages_field=packages_field,
+                                             include_tags=include_tags,
+                                             include_extras=include_extras,
+                                             include_groups=include_groups,
+                                             include_users=include_users,
+                                             include_member_count=include_member_count,)
+
+    if is_org:
+        plugin_type = plugins.IOrganizationController
+    else:
+        plugin_type = plugins.IGroupController
+
+    for item in plugins.PluginImplementations(plugin_type):
+        item.read(group)
+
+    group_plugin = lib_plugins.lookup_group_plugin(group_dict['type'])
+
+    if context.get("schema"):
+        schema: Schema = context["schema"]
+    elif hasattr(group_plugin, "show_group_schema"):
+        schema: Schema = group_plugin.show_group_schema()
+    # TODO: remove these fallback deprecated methods in the next release
+    elif hasattr(group_plugin, "db_to_form_schema_options"):
+        schema: Schema = getattr(group_plugin, "db_to_form_schema_options")({
+            'type': 'show', 'api': 'api_version' in context,
+            'context': context})
+    else:
+        schema: Schema = group_plugin.db_to_form_schema()
+
+    if include_followers:
+        context = plugins.toolkit.fresh_context(context)
+        group_dict['num_followers'] = logic.get_action('group_follower_count')(
+            context,
+            {'id': group_dict['id']})
+    else:
+        group_dict['num_followers'] = 0
+
+    group_dict, _errors = lib_plugins.plugin_validate(
+        group_plugin, context, group_dict, schema,
+        'organization_show' if is_org else 'group_show')
+    return group_dict
+
+def _format_translated_fields(data_dict):
+    fields_to_format = {k.split("_translated-")[0] for k in data_dict.keys() if "_translated-" in k}
+
+    for field in fields_to_format:
+        translated_map = {}
+        matched_keys = [k for k in data_dict.keys() if k.startswith(f"{field}_translated-")]
+
+        for key in matched_keys:
+            lang = key.split("-")[-1]
+            translated_map[lang] = data_dict.pop(key)
+
+        if translated_map:
+            data_dict[f"{field}_translated"] = json.dumps(translated_map)
+
+    return data_dict
+
+def _translate_resources(context, data_dict):
+    if 'resources' in data_dict and isinstance(data_dict['resources'], list):
+        for resource in data_dict['resources']:
+            _translate_fields(context, resource, RESOURCE_FIELDS, translate_resources=False)
+
+    return data_dict
+
+# Dataset Actions
+
+@logic.chained_action
+def package_update(next_action, context: Context, data_dict: DataDict) -> ActionResult:
+    translated_data_dict = _translate_fields(context, data_dict, DATASET_FIELDS)
+
+    return next_action(context, translated_data_dict)
+
+@logic.chained_action
+def package_create(next_action, context: Context, data_dict: DataDict) -> ActionResult:
+    translated_data_dict = _translate_fields(context, data_dict, DATASET_FIELDS)
+
+    return next_action(context, translated_data_dict)
+
+@logic.chained_action
+def package_patch(next_action, context, data_dict):
+    translated_data_dict = _translate_fields(context, data_dict, DATASET_FIELDS)
+
+    return next_action(context, translated_data_dict)
+
+# Resource Actions
+
+@logic.chained_action
+def resource_create(next_action, context: Context, data_dict: DataDict) -> ActionResult:
+    translated_data_dict = _translate_fields(context, data_dict, RESOURCE_FIELDS)
+
+    return next_action(context, translated_data_dict)
+
+@logic.chained_action
+def resource_update(next_action, context: Context, data_dict: DataDict) -> ActionResult:
+    translated_data_dict = _translate_fields(context, data_dict, RESOURCE_FIELDS)
+
+    return next_action(context, translated_data_dict)
+
+@logic.chained_action
+def resource_patch(next_action, context, data_dict):
+    translated_data_dict = _translate_fields(context, data_dict, RESOURCE_FIELDS)
+
+    return next_action(context, translated_data_dict)
+
+# Organization Actions
+
+@logic.chained_action
+def organization_create(next_action, context, data_dict):
+    translated_data_dict = _translate_fields(context, data_dict, GROUP_ORG_FIELDS)
+
+    return next_action(context, translated_data_dict)
+
+@logic.chained_action
+def organization_update(next_action, context, data_dict):
+    translated_data_dict = _translate_fields(context, data_dict, GROUP_ORG_FIELDS)
+
+    return next_action(context, translated_data_dict)
+
+@logic.chained_action
+def organization_patch(next_action, context, data_dict):
+    translated_data_dict = _translate_fields(context, data_dict, GROUP_ORG_FIELDS)
+
+    return next_action(context, translated_data_dict)
+
+@logic.side_effect_free
+def organization_show(context, data_dict):
+    data_dict = _group_or_org_show(context, data_dict, is_org=True)
+    translated_data_dict = _group_translate(data_dict)
+
+    return translated_data_dict
+
+# Group Actions
+
+@logic.chained_action
+def group_create(next_action, context, data_dict):
+    translated_data_dict = _translate_fields(context, data_dict, GROUP_ORG_FIELDS)
+
+    return next_action(context, translated_data_dict)
+
+@logic.chained_action
+def group_update(next_action, context, data_dict):
+    translated_data_dict = _translate_fields(context, data_dict, GROUP_ORG_FIELDS)
+
+    return next_action(context, translated_data_dict)
+
+@logic.chained_action
+def group_patch(next_action, context, data_dict):
+    translated_data_dict = _translate_fields(context, data_dict, GROUP_ORG_FIELDS)
+
+    return next_action(context, translated_data_dict)
+
+@logic.side_effect_free
+def group_show(context, data_dict):
+    group_dict = _group_or_org_show(context, data_dict, is_org=False)
+    translated_data_dict = _group_translate(group_dict)
+
+    return translated_data_dict

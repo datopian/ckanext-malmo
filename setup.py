@@ -3,7 +3,7 @@ from setuptools import setup, find_namespace_packages
 setup(
     name='ckanext-malmo',
     version='0.1',
-    description="Organization masking for Malmo Stad",
+    description="Customizations for Malmo Stad",
     long_description=""" """,
     classifiers=[],
     keywords='',

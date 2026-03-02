@@ -1,123 +1,38 @@
 import logging
 import ckan.plugins as plugins
-import ckan.plugins.toolkit as toolkit
+from ckan.plugins import toolkit
+
+from ckanext.malmo import actions as malmo_actions
 
 log = logging.getLogger(__name__)
 
 
 class MalmoPlugin(plugins.SingletonPlugin):
     plugins.implements(plugins.IPackageController, inherit=True)
+    plugins.implements(plugins.IConfigurer)
+    plugins.implements(plugins.IActions)
 
-    # The organization name and ID to use for masking
-    MALMO_ORG_NAME = "malmo"
-    MALMO_ORG_TITLE = "Malmö Stad"
-
-    def _mask_organization(self, pkg_dict, context={}):
+    def update_config(self, config):
         """
-        Generic method to replace organization info in a dataset dict.
+        We have some form snippets that support ckanext-scheming
         """
-        if not pkg_dict or context.get("for_view", False):
-            return pkg_dict
+        toolkit.add_template_directory(config, 'templates')
+        toolkit.add_resource('assets', 'malmo')
 
-        # We assume the 'malmo-stad' organization exists.
-        # To find its ID, we can use organization_show in a real environment,
-        # but for masking purposes, we mainly want the 'organization' dict
-        # and 'owner_org' to be consistent.
-
-        # We'll try to get the actual ID if possible, but if the extension is
-        # running in a context where we can't easily call actions, we might
-        # just use a placeholder or the name.
-
-        masked_org = {
-            "name": self.MALMO_ORG_NAME,
-            "title": self.MALMO_ORG_TITLE,
-            "type": "organization",
-            "state": "active",
-            "image_url": "",  # Could be set to an official logo
-            "description": "Malmö Stad Organization",
+    def get_actions(self):
+        return {
+            'package_update': malmo_actions.package_update,
+            'package_create': malmo_actions.package_create,
+            'package_patch': malmo_actions.package_patch,
+            'resource_create': malmo_actions.resource_create,
+            'resource_update': malmo_actions.resource_update,
+            'resource_patch': malmo_actions.resource_patch,
+            'organization_create': malmo_actions.organization_create,
+            'organization_update': malmo_actions.organization_update,
+            'organization_patch': malmo_actions.organization_patch,
+            'organization_show': malmo_actions.organization_show,
+            'group_create': malmo_actions.group_create,
+            'group_update': malmo_actions.group_update,
+            'group_patch': malmo_actions.group_patch,
+            'group_show': malmo_actions.group_show,
         }
-
-        # Replace the organization dictionary
-        pkg_dict["organization"] = masked_org
-
-        # Note: we don't necessarily change owner_org ID here unless we have
-        # the real ID of 'malmo-stad'. If we don't, the API might still show
-        # the original ID in 'owner_org' field, but 'organization' dict
-        # (which is what most frontends/APIs use) will be masked.
-        # Ideally, we should fetch the ID.
-
-        try:
-            # Try to get the real organization. We cache it if possible.
-            # This is a bit tricky inside IPackageController as it's called often.
-            pass
-        except:
-            pass
-
-        return pkg_dict
-
-    def after_dataset_show(self, context, pkg_dict):
-        """
-        Intersects package_show data.
-        """
-        for_view = context.get("for_view", False)
-
-        if for_view:
-            return pkg_dict
-
-        return self._mask_organization(pkg_dict)
-
-    def before_dataset_view(self, pkg_dict):
-        """
-        Intersects package_view data.
-        """
-        owner_org = pkg_dict.get("owner_org")
-        org = None
-
-        if owner_org:
-            try:
-                org = toolkit.get_action("organization_show")(
-                    {"ignore_auth": True}, {"id": owner_org}
-                )
-            except Exception as e:
-                log.error(f"Error fetching organization: {e}")
-
-        if org:
-            pkg_dict["organization"] = org
-
-        return pkg_dict
-
-    def before_dataset_index(self, pkg_dict):
-        """
-        Intersects package_index data.
-        """
-        current_org = pkg_dict.get("organization", {})
-        org_id = (
-            current_org.get("id")
-            if (current_org and isinstance(current_org, dict))
-            else None
-        ) or pkg_dict.get("owner_org")
-        org = None
-
-        if org_id:
-            try:
-                org = toolkit.get_action("organization_show")(
-                    {"ignore_auth": True}, {"id": org_id}
-                )
-                org_id = org.get("id")
-            except Exception as e:
-                log.error(f"Error fetching organization: {e}")
-
-        if org:
-            pkg_dict["organization"] = org["name"]
-
-        return pkg_dict
-
-    def after_dataset_search(self, search_results, search_params):
-        """
-        Intersects package_search results.
-        """
-        if "results" in search_results:
-            for pkg_dict in search_results["results"]:
-                self._mask_organization(pkg_dict)
-
-        return search_results
