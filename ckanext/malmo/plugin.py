@@ -24,6 +24,8 @@ class MalmoPlugin(plugins.SingletonPlugin):
             'package_update': malmo_actions.package_update,
             'package_create': malmo_actions.package_create,
             'package_patch': malmo_actions.package_patch,
+            'package_show': malmo_actions.package_show,
+            'package_search': malmo_actions.package_search,
             'resource_create': malmo_actions.resource_create,
             'resource_update': malmo_actions.resource_update,
             'resource_patch': malmo_actions.resource_patch,
@@ -35,4 +37,5 @@ class MalmoPlugin(plugins.SingletonPlugin):
             'group_update': malmo_actions.group_update,
             'group_patch': malmo_actions.group_patch,
             'group_show': malmo_actions.group_show,
+            'group_list': malmo_actions.group_list,
         }
