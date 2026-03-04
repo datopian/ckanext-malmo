@@ -49,7 +49,6 @@ RESOURCE_FIELDS = [
 GROUP_ORG_FIELDS = [
     "title",
     "description",
-    "display_name",
 ]
 
 
@@ -59,30 +58,30 @@ def _translate_fields(
     html_convert = html2text.HTML2Text()
     default_lang = config.get("ckan.locale_default", "sv").split("_")[0]
 
-    for field in fields_to_translate:
-        val = data_dict.get(field, "")
-        data_dict["{}_translated-{}".format(field, default_lang)] = val
+    internal_results = {}
+
+    for field_name in fields_to_translate:
+        val = data_dict.get(field_name, "")
+        internal_results[f"{field_name}_translated-{default_lang}"] = val
 
     languages_offered = config.get("ckan.locales_offered", ["en", "da_DK"])
-    languages = [
+    target_languages = [
         lang.split("_")[0] for lang in languages_offered if lang != default_lang
     ]
 
-    for language_code in languages:
+    for language_code in target_languages:
         payload_to_translate = {}
 
         for field_name in fields_to_translate:
-            raw_value = data_dict.get(field_name)
+            source_text = data_dict.get(field_name, "")
 
-            if raw_value and str(raw_value).strip():
+            if source_text and str(source_text).strip():
                 if field_name in ["notes", "description"]:
-                    payload_to_translate[field_name] = markdown.markdown(raw_value)
+                    payload_to_translate[field_name] = markdown.markdown(source_text)
                 else:
-                    payload_to_translate[field_name] = raw_value
+                    payload_to_translate[field_name] = source_text
 
         if not payload_to_translate:
-            for field_name in fields_to_translate:
-                data_dict[f"{field_name}_translated-{language_code}"] = data_dict.get(field_name, "")
             continue
 
         try:
@@ -95,41 +94,40 @@ def _translate_fields(
                 },
             )
 
-            translated_outputs = translation_response.get("output", {})
+            outputs = translation_response.get("output", {})
 
-            for field_name in fields_to_translate:
-                if field_name in translated_outputs:
-                    translated_text = translated_outputs[field_name]
+            for field_name, translated_val in outputs.items():
+                if translated_val:
+                    translated_val = translated_val.strip("\n")
 
-                    if translated_text:
-                        translated_text = translated_text.strip("\n")
+                    if field_name in ["notes", "description"]:
+                        translated_val = html_convert.handle(translated_val)
 
-                    if field_name == "notes" and translated_text:
-                        translated_text = html_convert.handle(translated_text)
-
-                    data_dict[f"{field_name}_translated-{language_code}"] = translated_text
-                else:
-                    data_dict[f"{field_name}_translated-{language_code}"] = data_dict.get(field_name, "")
+                    internal_results[f"{field_name}_translated-{language_code}"] = (
+                        translated_val
+                    )
 
         except Exception as error:
-            log.error(f"Translation service error for {language_code}: {error}")
+            log.debug(f"Translation failed for {language_code}: {error}")
 
-            for field_name in fields_to_translate:
-                data_dict[f"{field_name}_translated-{language_code}"] = data_dict.get(field_name, "")
+    for field_name in fields_to_translate:
+        field_map = {}
 
-    for field in fields_to_translate:
-        existing_translations = data_dict.get("{}_translated".format(field))
+        for key, value in internal_results.items():
+            if key.startswith(f"{field_name}_translated-"):
+                lang_suffix = key.split("-")[-1]
 
-        if isinstance(existing_translations, dict):
-            for lang in existing_translations.keys():
-                flat_key = "{}_translated-{}".format(field, lang)
-                if flat_key in data_dict:
-                    data_dict["{}_translated".format(field)][lang] = data_dict[flat_key]
+                field_map[lang_suffix] = value if value else ""
 
-    data_dict = _format_translated_fields(data_dict)
+        data_dict[f"{field_name}_translated"] = json.dumps(field_map)
 
     if translate_resources and "resources" in data_dict:
         data_dict = _translate_resources(context, data_dict)
+
+    if "extras" in data_dict:
+        data_dict["extras"] = [
+            e for e in data_dict["extras"] if e.get("key") != "display_name"
+        ]
 
     return data_dict
 
@@ -141,8 +139,7 @@ def _group_translate(data_dict):
     if group_title:
         data_dict["display_name_translated"] = group_title
 
-    for field in GROUP_ORG_FIELDS:
-        key = f"{field}_translated"
+    for key in [k for k in data_dict.keys() if k.endswith("_translated")]:
         translated_field = data_dict.get(key)
 
         if translated_field and isinstance(translated_field, str):
@@ -332,47 +329,77 @@ def package_show(next_action, context, data_dict):
 @logic.chained_action
 def package_search(next_action, context, data_dict):
     search_results = next_action(context, data_dict)
-    search_facets = search_results.get("search_facets", {})
-    translated_metadata_cache = {}
 
-    for facet_type in ["organization", "groups"]:
-        if facet_type not in search_facets:
-            continue
+    for package in search_results.get("results", []):
+        org_id = package.get("organization", {}).get("id")
 
-        facet_group = search_facets[facet_type]
-        for facet_item in facet_group.get("items", []):
-            entity_id = facet_item.get("name")
+        if org_id:
+            try:
+                org_dict = _get_action("organization_show")(context, {"id": org_id})
+                package["organization"].update(
+                    {k: v for k, v in org_dict.items() if k.endswith("_translated")}
+                )
+            except (NotAuthorized, NotFound):
+                pass
 
-            if entity_id not in translated_metadata_cache:
+        for group in package.get("groups", []):
+            group_id = group.get("id")
+
+            if group_id:
                 try:
-                    action_name = (
-                        "organization_show"
-                        if facet_type == "organization"
-                        else "group_show"
+                    group_dict = _get_action("group_show")(context, {"id": group_id})
+                    group.update(
+                        {
+                            k: v
+                            for k, v in group_dict.items()
+                            if k.endswith("_translated")
+                        }
                     )
-                    entity_details = _get_action(action_name)(
-                        context, {"id": entity_id}
-                    )
-
-                    translated_metadata_cache[entity_id] = {
-                        key: value
-                        for key, value in entity_details.items()
-                        if key.endswith("_translated")
-                    }
                 except (NotAuthorized, NotFound):
-                    translated_metadata_cache[entity_id] = {}
+                    continue
 
-            if translated_metadata_cache[entity_id]:
-                facet_item.update(translated_metadata_cache[entity_id])
+    search_facets = search_results.get("search_facets", {})
 
-                current_lang = context.get(
-                    "lang", config.get("ckan.locale_default", "sv").split("_")[0]
-                )
-                title_translations = translated_metadata_cache[entity_id].get(
-                    "title_translated"
-                )
-                if title_translations and current_lang in title_translations:
-                    facet_item["display_name"] = title_translations[current_lang]
+    if search_facets:
+        translated_metadata_cache = {}
+
+        for facet_type in ["organization", "groups"]:
+            if facet_type not in search_facets:
+                continue
+
+            facet_group = search_facets[facet_type]
+
+            for facet_item in facet_group.get("items", []):
+                entity_id = facet_item.get("name")
+                if entity_id not in translated_metadata_cache:
+                    try:
+                        action_name = (
+                            "organization_show"
+                            if facet_type == "organization"
+                            else "group_show"
+                        )
+                        entity_details = _get_action(action_name)(
+                            context, {"id": entity_id}
+                        )
+                        translated_metadata_cache[entity_id] = {
+                            k: v
+                            for k, v in entity_details.items()
+                            if k.endswith("_translated")
+                        }
+                    except (NotAuthorized, NotFound):
+                        translated_metadata_cache[entity_id] = {}
+
+                if translated_metadata_cache[entity_id]:
+                    facet_item.update(translated_metadata_cache[entity_id])
+
+                    current_lang = context.get(
+                        "lang", config.get("ckan.locale_default", "sv").split("_")[0]
+                    )
+                    title_trans = translated_metadata_cache[entity_id].get(
+                        "title_translated", {}
+                    )
+                    if isinstance(title_trans, dict) and title_trans.get(current_lang):
+                        facet_item["display_name"] = title_trans[current_lang]
 
     return search_results
 
