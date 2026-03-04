@@ -328,78 +328,81 @@ def package_show(next_action, context, data_dict):
 @logic.side_effect_free
 @logic.chained_action
 def package_search(next_action, context, data_dict):
+    if context.get("ignore_search_translations"):
+        return next_action(context, data_dict)
+
     search_results = next_action(context, data_dict)
 
-    for package in search_results.get("results", []):
-        org_id = package.get("organization", {}).get("id")
+    internal_context = context.copy()
+    internal_context.update({"ignore_auth": True, "ignore_search_translations": True})
 
-        if org_id:
-            try:
-                org_dict = _get_action("organization_show")(context, {"id": org_id})
-                package["organization"].update(
-                    {k: v for k, v in org_dict.items() if k.endswith("_translated")}
-                )
-            except (NotAuthorized, NotFound):
-                pass
+    organizations_data = _get_action("organization_list")(
+        internal_context, {"all_fields": True, "include_extras": True}
+    )
+    groups_data = _get_action("group_list")(
+        internal_context, {"all_fields": True, "include_extras": True}
+    )
+
+    organization_lookup = {}
+
+    for organization in organizations_data:
+        translated_fields = {
+            k: v
+            for k, v in organization.items()
+            if k.endswith("_translated") or k in ["name", "id"]
+        }
+        organization_lookup[organization["id"]] = translated_fields
+        organization_lookup[organization["name"]] = translated_fields
+
+    group_lookup = {}
+
+    for group in groups_data:
+        translated_fields = {
+            k: v
+            for k, v in group.items()
+            if k.endswith("_translated") or k in ["name", "id"]
+        }
+        group_lookup[group["id"]] = translated_fields
+        group_lookup[group["name"]] = translated_fields
+
+    for package in search_results.get("results", []):
+        organization_id = package.get("organization", {}).get("id")
+
+        if organization_id in organization_lookup:
+            package["organization"].update(organization_lookup[organization_id])
 
         for group in package.get("groups", []):
             group_id = group.get("id")
 
-            if group_id:
-                try:
-                    group_dict = _get_action("group_show")(context, {"id": group_id})
-                    group.update(
-                        {
-                            k: v
-                            for k, v in group_dict.items()
-                            if k.endswith("_translated")
-                        }
-                    )
-                except (NotAuthorized, NotFound):
-                    continue
+            if group_id in group_lookup:
+                group.update(group_lookup[group_id])
 
     search_facets = search_results.get("search_facets", {})
+    current_lang = context.get(
+        "lang", config.get("ckan.locale_default", "sv").split("_")[0]
+    )
 
-    if search_facets:
-        translated_metadata_cache = {}
+    for facet_type in ["organization", "groups"]:
+        if facet_type not in search_facets:
+            continue
 
-        for facet_type in ["organization", "groups"]:
-            if facet_type not in search_facets:
-                continue
+        facet_group = search_facets[facet_type]
+        lookup_map = (
+            organization_lookup if facet_type == "organization" else group_lookup
+        )
 
-            facet_group = search_facets[facet_type]
+        for facet_item in facet_group.get("items", []):
+            entity_name = facet_item.get("name")
 
-            for facet_item in facet_group.get("items", []):
-                entity_id = facet_item.get("name")
-                if entity_id not in translated_metadata_cache:
-                    try:
-                        action_name = (
-                            "organization_show"
-                            if facet_type == "organization"
-                            else "group_show"
-                        )
-                        entity_details = _get_action(action_name)(
-                            context, {"id": entity_id}
-                        )
-                        translated_metadata_cache[entity_id] = {
-                            k: v
-                            for k, v in entity_details.items()
-                            if k.endswith("_translated")
-                        }
-                    except (NotAuthorized, NotFound):
-                        translated_metadata_cache[entity_id] = {}
+            if entity_name in lookup_map:
+                facet_item.update(lookup_map[entity_name])
 
-                if translated_metadata_cache[entity_id]:
-                    facet_item.update(translated_metadata_cache[entity_id])
+                title_translations = lookup_map[entity_name].get("title_translated", {})
 
-                    current_lang = context.get(
-                        "lang", config.get("ckan.locale_default", "sv").split("_")[0]
-                    )
-                    title_trans = translated_metadata_cache[entity_id].get(
-                        "title_translated", {}
-                    )
-                    if isinstance(title_trans, dict) and title_trans.get(current_lang):
-                        facet_item["display_name"] = title_trans[current_lang]
+                if isinstance(title_translations, dict) and title_translations.get(
+                    current_lang
+                ):
+                    facet_item["display_name"] = title_translations[current_lang]
 
     return search_results
 
