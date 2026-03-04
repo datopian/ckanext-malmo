@@ -68,50 +68,54 @@ def _translate_fields(
         lang.split("_")[0] for lang in languages_offered if lang != default_lang
     ]
 
-    for lang in languages:
-        try:
-            translation_input = {
-                f: (
-                    markdown.markdown(data_dict.get(f, ""))
-                    if f == "notes"
-                    else data_dict.get(f, "")
-                )
-                for f in fields_to_translate
-            }
+    for language_code in languages:
+        payload_to_translate = {}
 
-            translation = _get_action("translate")(
+        for field_name in fields_to_translate:
+            raw_value = data_dict.get(field_name)
+
+            if raw_value and str(raw_value).strip():
+                if field_name in ["notes", "description"]:
+                    payload_to_translate[field_name] = markdown.markdown(raw_value)
+                else:
+                    payload_to_translate[field_name] = raw_value
+
+        if not payload_to_translate:
+            for field_name in fields_to_translate:
+                data_dict[f"{field_name}_translated-{language_code}"] = data_dict.get(field_name, "")
+            continue
+
+        try:
+            translation_response = _get_action("translate")(
                 context,
                 {
-                    "input": translation_input,
+                    "input": payload_to_translate,
                     "from": default_lang,
-                    "to": lang,
+                    "to": language_code,
                 },
             )
 
-            outputs = translation.get("output", {})
+            translated_outputs = translation_response.get("output", {})
 
-            for field in fields_to_translate:
-                translated_val = outputs.get(field, "")
+            for field_name in fields_to_translate:
+                if field_name in translated_outputs:
+                    translated_text = translated_outputs[field_name]
 
-                if translated_val:
-                    translated_val = translated_val.strip("\n")
+                    if translated_text:
+                        translated_text = translated_text.strip("\n")
 
-                if field == "notes":
-                    translated_val = html_convert.handle(translated_val)
+                    if field_name == "notes" and translated_text:
+                        translated_text = html_convert.handle(translated_text)
 
-                data_dict["{}_translated-{}".format(field, lang)] = translated_val
+                    data_dict[f"{field_name}_translated-{language_code}"] = translated_text
+                else:
+                    data_dict[f"{field_name}_translated-{language_code}"] = data_dict.get(field_name, "")
 
-        except Exception as e:
-            log.debug(
-                "Unable to retrieve {} translation for {}: {}".format(
-                    lang, data_dict.get("name"), e
-                )
-            )
+        except Exception as error:
+            log.error(f"Translation service error for {language_code}: {error}")
 
-            for field in fields_to_translate:
-                data_dict["{}_translated-{}".format(field, lang)] = data_dict.get(
-                    field, ""
-                )
+            for field_name in fields_to_translate:
+                data_dict[f"{field_name}_translated-{language_code}"] = data_dict.get(field_name, "")
 
     for field in fields_to_translate:
         existing_translations = data_dict.get("{}_translated".format(field))
