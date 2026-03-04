@@ -346,11 +346,45 @@ def package_search(next_action, context, data_dict):
     organization_lookup = {}
 
     for organization in organizations_data:
-        translated_fields = {
-            k: v
-            for k, v in organization.items()
-            if k.endswith("_translated") or k in ["name", "id"]
-        }
+        translated_fields = {}
+
+        for k, v in organization.items():
+            if k == "name" or k == "id":
+                translated_fields[k] = v
+
+            elif k.endswith("_translated"):
+                current_val = v
+
+                while isinstance(current_val, str) and current_val.strip().startswith(
+                    ("{", '"')
+                ):
+                    try:
+                        decoded = json.loads(current_val)
+                        if decoded == current_val:
+                            break
+                        current_val = decoded
+                    except (json.JSONDecodeError, TypeError):
+                        break
+
+                if isinstance(current_val, dict):
+                    cleaned_dict = {}
+
+                    for lang, text in current_val.items():
+                        if isinstance(text, str):
+                            cleaned_text = text.strip().strip('"').strip()
+
+                            if cleaned_text:
+                                cleaned_dict[lang] = cleaned_text
+
+                    if cleaned_dict:
+                        translated_fields[k] = cleaned_dict
+
+                elif isinstance(current_val, str):
+                    cleaned_text = current_val.strip().strip('"').strip()
+
+                    if cleaned_text:
+                        translated_fields[k] = cleaned_text
+
         organization_lookup[organization["id"]] = translated_fields
         organization_lookup[organization["name"]] = translated_fields
 
@@ -495,26 +529,59 @@ def group_show(context, data_dict):
     return translated_data_dict
 
 
+def _get_all_group_translations(model):
+    from ckan.model import GroupExtra
+
+    extras = (
+        model.Session.query(GroupExtra)
+        .filter(GroupExtra.key.contains("_translated"))
+        .all()
+    )
+
+    mapping = {}
+    for e in extras:
+        if e.group_id not in mapping:
+            mapping[e.group_id] = {}
+        mapping[e.group_id][e.key] = e.value
+    return mapping
+
+
 @logic.side_effect_free
 @logic.chained_action
 def group_list(next_action, context, data_dict):
-    group_list = next_action(context, data_dict)
-    all_fields = data_dict.get("all_fields", False)
+    groups = next_action(context, data_dict)
 
-    if all_fields:
-        for group in group_list:
-            group_id = group.get("id")
-            if group_id:
-                try:
-                    group_details = _get_action("group_show")(context, {"id": group_id})
-                    group.update(
-                        {
-                            k: v
-                            for k, v in group_details.items()
-                            if k.endswith("_translated")
-                        }
-                    )
-                except (NotAuthorized, NotFound):
-                    continue
+    if context.get("is_internal_translation_call") or not data_dict.get("all_fields"):
+        return groups
 
-    return group_list
+    all_trans = _get_all_group_translations(context["model"])
+
+    for group in groups:
+        gid = group.get("id")
+
+        if gid in all_trans:
+            group.update(all_trans[gid])
+
+        for key in list(group.keys()):
+            if key.endswith("_translated"):
+                val = group[key]
+
+                if isinstance(val, str):
+                    try:
+                        val = json.loads(val)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+
+                if isinstance(val, dict):
+                    if not any(str(v).strip() for v in val.values()):
+                        del group[key]
+                    else:
+                        group[key] = val
+
+                elif not str(val).strip():
+                    del group[key]
+
+        if "title_translated" in group:
+            group["display_name_translated"] = group["title_translated"]
+
+    return groups
