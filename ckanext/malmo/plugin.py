@@ -37,5 +37,4 @@ class MalmoPlugin(plugins.SingletonPlugin):
             'group_update': malmo_actions.group_update,
             'group_patch': malmo_actions.group_patch,
             'group_show': malmo_actions.group_show,
-            'group_list': malmo_actions.group_list,
         }
