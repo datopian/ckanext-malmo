@@ -133,7 +133,11 @@ def _translate_fields(
                     else data_dict.get(field_name, "")
                 )
                 for field_name in fields_to_translate
+                if data_dict.get(field_name) and field_name != "display_name"
             }
+
+            if not translation_payload:
+                continue
 
             translation_result = _get_action("translate")(
                 context,
@@ -155,6 +159,14 @@ def _translate_fields(
                 data_dict["{}_translated-{}".format(field_name, language_code)] = (
                     translated_text
                 )
+
+            if "display_name" in fields_to_translate:
+                title_key = f"title_translated-{language_code}"
+
+                if title_key in data_dict:
+                    data_dict[f"display_name_translated-{language_code}"] = data_dict[
+                        title_key
+                    ]
 
         except Exception as error:
             log.debug(f"Translation failed for {language_code}: {error}")
