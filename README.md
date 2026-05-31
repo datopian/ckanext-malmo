@@ -35,6 +35,15 @@ The DWG preview code supports these CKAN config settings:
 - `ckanext.malmo.dwg_preview_max_download_bytes`
   Maximum DWG download size in bytes.
 
+- `ckanext.malmo.dwg_preview_stroke_min_width`
+  Minimum stroke width (in px) enforced on generated SVG previews. Default: `1.4`.
+
+- `ckanext.malmo.dwg_preview_stroke_color`
+  Stroke color enforced on generated SVG previews. Default: `#111111`.
+
+- `ckanext.malmo.dwg_preview_stroke_opacity`
+  Stroke opacity enforced on generated SVG previews. Range: `0.0` to `1.0`. Default: `1.0`.
+
 If these settings are not provided, the extension uses built-in defaults.
 
 ## Installation

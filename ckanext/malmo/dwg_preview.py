@@ -34,6 +34,9 @@ DWG_MIME_TYPES = {
 DEFAULT_TIMEOUT_SECONDS = 30
 DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 30
 DEFAULT_MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
+DEFAULT_STROKE_MIN_WIDTH = 1.2
+DEFAULT_STROKE_COLOR = "#111111"
+DEFAULT_STROKE_OPACITY = 1.0
 DOWNLOAD_CHUNK_SIZE = 64 * 1024
 SVG_VIEWBOX_RE = re.compile(
     r'viewBox="(?P<min_x>-?\d+(?:\.\d+)?)\s+'
@@ -44,6 +47,7 @@ SVG_VIEWBOX_RE = re.compile(
 SVG_ROOT_TAG_RE = re.compile(r"<svg\b[^>]*>", re.IGNORECASE | re.DOTALL)
 SVG_WIDTH_ATTR_RE = re.compile(r'width="[^"]*"', re.IGNORECASE)
 SVG_HEIGHT_ATTR_RE = re.compile(r'height="[^"]*"', re.IGNORECASE)
+SVG_DEFS_CLOSE_RE = re.compile(r"</defs>", re.IGNORECASE)
 SVG_DRAWABLE_TAG_RE = re.compile(
     r"<(?:use|path|line|polyline|polygon|circle|ellipse|text)\b",
     re.IGNORECASE,
@@ -353,6 +357,7 @@ def _attempt_svg_conversion(
     try:
         _run_dwg_to_svg(source_path, svg_path, timeout, mspace_only=mspace_only)
         _normalize_svg_viewbox(svg_path)
+        _enhance_svg_strokes(svg_path)
         drawable_count, size_bytes = _measure_svg_preview(svg_path)
         return {
             "mode": mode_label,
@@ -435,6 +440,88 @@ def _run_dwg_to_svg(
                 ]
             }
         )
+
+
+def _enhance_svg_strokes(svg_path: str) -> None:
+    min_stroke_width = _get_float_config(
+        "ckanext.malmo.dwg_preview_stroke_min_width",
+        DEFAULT_STROKE_MIN_WIDTH,
+    )
+    stroke_color = str(
+        toolkit.config.get("ckanext.malmo.dwg_preview_stroke_color") or DEFAULT_STROKE_COLOR
+    ).strip() or DEFAULT_STROKE_COLOR
+    stroke_opacity = _get_float_config(
+        "ckanext.malmo.dwg_preview_stroke_opacity",
+        DEFAULT_STROKE_OPACITY,
+    )
+
+    min_stroke_width = max(0.1, min_stroke_width)
+    stroke_opacity = min(max(0.0, stroke_opacity), 1.0)
+
+    try:
+        with open(svg_path, "r", encoding="utf-8") as svg_file:
+            svg_text = svg_file.read()
+    except OSError as err:
+        raise ValidationError({"conversion": [f"Could not read generated SVG: {err}"]})
+
+    style_block = (
+        "<style id=\"ckan-dwg-preview-stroke-style\">"
+        ".ckan-dwg-preview-scope path,"
+        ".ckan-dwg-preview-scope line,"
+        ".ckan-dwg-preview-scope polyline,"
+        ".ckan-dwg-preview-scope polygon,"
+        ".ckan-dwg-preview-scope circle,"
+        ".ckan-dwg-preview-scope ellipse,"
+        ".ckan-dwg-preview-scope use{"
+        f"stroke:{stroke_color} !important;"
+        f"stroke-width:{min_stroke_width}px !important;"
+        "vector-effect:non-scaling-stroke !important;"
+        "stroke-linecap:round;"
+        "stroke-linejoin:round;"
+        f"stroke-opacity:{stroke_opacity} !important;"
+        "}"
+        "</style>"
+    )
+
+    normalized_svg = svg_text
+
+    if "ckan-dwg-preview-scope" not in normalized_svg:
+        root_tag_match = SVG_ROOT_TAG_RE.search(normalized_svg)
+        if root_tag_match:
+            root_tag = root_tag_match.group(0)
+            if "class=" in root_tag:
+                scoped_root = re.sub(
+                    r'class="([^"]*)"',
+                    r'class="\1 ckan-dwg-preview-scope"',
+                    root_tag,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+            else:
+                scoped_root = root_tag[:-1] + ' class="ckan-dwg-preview-scope">'
+            start, end = root_tag_match.span()
+            normalized_svg = normalized_svg[:start] + scoped_root + normalized_svg[end:]
+
+    if "ckan-dwg-preview-stroke-style" not in normalized_svg:
+        defs_close_match = SVG_DEFS_CLOSE_RE.search(normalized_svg)
+        if defs_close_match:
+            insert_at = defs_close_match.end()
+            normalized_svg = normalized_svg[:insert_at] + style_block + normalized_svg[insert_at:]
+        else:
+            root_tag_match = SVG_ROOT_TAG_RE.search(normalized_svg)
+            if root_tag_match:
+                insert_at = root_tag_match.end()
+                normalized_svg = normalized_svg[:insert_at] + style_block + normalized_svg[insert_at:]
+
+    if normalized_svg == svg_text:
+        return
+
+    try:
+        with open(svg_path, "w", encoding="utf-8") as svg_file:
+            svg_file.write(normalized_svg)
+    except OSError as err:
+        raise ValidationError({"conversion": [f"Could not normalize generated SVG: {err}"]})
+
 
 def _normalize_svg_viewbox(svg_path: str) -> None:
     """
@@ -562,4 +649,20 @@ def _get_int_config(config_key: str, default_value: int) -> int:
         return int(raw_value)
     except (TypeError, ValueError):
         log.warning("Invalid integer config for %s=%r, using default %s", config_key, raw_value, default_value)
+        return default_value
+
+
+def _get_float_config(config_key: str, default_value: float) -> float:
+    raw_value = toolkit.config.get(config_key)
+    if raw_value in (None, ""):
+        return default_value
+    try:
+        return float(raw_value)
+    except (TypeError, ValueError):
+        log.warning(
+            "Invalid float config for %s=%r, using default %s",
+            config_key,
+            raw_value,
+            default_value,
+        )
         return default_value
