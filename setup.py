@@ -15,7 +15,8 @@ setup(
     include_package_data=True,
     zip_safe=False,
     install_requires=[
-        # list of dependencies
+        'html2text',
+        'requests',
     ],
     entry_points='''
         [ckan.plugins]

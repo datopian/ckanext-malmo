@@ -3,6 +3,8 @@ import ckan.plugins as plugins
 from ckan.plugins import toolkit
 
 from ckanext.malmo import actions as malmo_actions
+from ckanext.malmo.logic import action as malmo_logic_actions
+from ckanext.malmo import views as malmo_views
 
 log = logging.getLogger(__name__)
 
@@ -11,6 +13,7 @@ class MalmoPlugin(plugins.SingletonPlugin):
     plugins.implements(plugins.IPackageController, inherit=True)
     plugins.implements(plugins.IConfigurer)
     plugins.implements(plugins.IActions)
+    plugins.implements(plugins.IBlueprint)
 
     def update_config(self, config):
         """
@@ -21,6 +24,7 @@ class MalmoPlugin(plugins.SingletonPlugin):
 
     def get_actions(self):
         return {
+            'dwg_preview_convert': malmo_logic_actions.dwg_preview_convert,
             'package_update': malmo_actions.package_update,
             'package_create': malmo_actions.package_create,
             'package_patch': malmo_actions.package_patch,
@@ -38,3 +42,6 @@ class MalmoPlugin(plugins.SingletonPlugin):
             'group_patch': malmo_actions.group_patch,
             'group_show': malmo_actions.group_show,
         }
+
+    def get_blueprint(self):
+        return malmo_views.get_blueprints()
