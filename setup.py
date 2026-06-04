@@ -17,6 +17,8 @@ setup(
     install_requires=[
         'html2text',
         'requests',
+        'ezdxf',
+        'PyMuPDF',
     ],
     entry_points='''
         [ckan.plugins]

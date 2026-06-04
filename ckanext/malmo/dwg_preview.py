@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import shutil
 import subprocess
 from tempfile import TemporaryDirectory
@@ -31,36 +30,20 @@ DWG_MIME_TYPES = {
     "image/vnd.dwg",
     "image/x-dwg",
 }
-DEFAULT_TIMEOUT_SECONDS = 30
+DEFAULT_TIMEOUT_SECONDS = 45
 DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 30
 DEFAULT_MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
-DEFAULT_STROKE_MIN_WIDTH = 1.2
-DEFAULT_STROKE_COLOR = "#111111"
-DEFAULT_STROKE_OPACITY = 1.0
+DEFAULT_ODA_OUTPUT_VERSION = "ACAD2018"
+DEFAULT_RENDER_MARGIN_MM = 4
+DEFAULT_RENDER_PAGE_SIZE_MM = 160
+DEFAULT_MIN_PREVIEW_BYTES = 1024
+DEFAULT_MAX_MODELSPACE_ENTITIES = 5000
 DOWNLOAD_CHUNK_SIZE = 64 * 1024
-SVG_VIEWBOX_RE = re.compile(
-    r'viewBox="(?P<min_x>-?\d+(?:\.\d+)?)\s+'
-    r'(?P<min_y>-?\d+(?:\.\d+)?)\s+'
-    r'(?P<width>\d+(?:\.\d+)?)\s+'
-    r'(?P<height>\d+(?:\.\d+)?)"'
-)
-SVG_ROOT_TAG_RE = re.compile(r"<svg\b[^>]*>", re.IGNORECASE | re.DOTALL)
-SVG_WIDTH_ATTR_RE = re.compile(r'width="[^"]*"', re.IGNORECASE)
-SVG_HEIGHT_ATTR_RE = re.compile(r'height="[^"]*"', re.IGNORECASE)
-SVG_DEFS_CLOSE_RE = re.compile(r"</defs>", re.IGNORECASE)
-SVG_DRAWABLE_TAG_RE = re.compile(
-    r"<(?:use|path|line|polyline|polygon|circle|ellipse|text)\b",
-    re.IGNORECASE,
-)
+PDF_MIMETYPE = "application/pdf"
+PDF_EXTENSION = "pdf"
 
 
 def build_preview_payload(context: dict[str, Any], data_dict: dict[str, Any]) -> dict[str, Any]:
-    """
-    Build a binary preview payload from a DWG resource.
-
-    The returned dictionary is meant for internal Python callers. The Flask
-    route turns this payload into an HTTP response with the correct mimetype.
-    """
     resource_id = (data_dict or {}).get("resource_id")
     if not resource_id:
         raise ValidationError({"resource_id": ["Missing value"]})
@@ -84,6 +67,8 @@ def build_preview_payload(context: dict[str, Any], data_dict: dict[str, Any]) ->
         DEFAULT_MAX_DOWNLOAD_BYTES,
     )
 
+    log.info("DWG preview requested for resource=%s format=pdf", resource_id)
+
     with TemporaryDirectory(prefix="ckan-dwg-preview-") as tmp_dir:
         source_path = _stage_resource_dwg(
             resource,
@@ -91,18 +76,14 @@ def build_preview_payload(context: dict[str, Any], data_dict: dict[str, Any]) ->
             max_download_bytes=max_download_bytes,
             download_timeout=download_timeout,
         )
-        output_path = _convert_dwg_to_best_svg(
-            source_path,
-            tmp_dir,
-            timeout=conversion_timeout,
-        )
-        with open(output_path, "rb") as output_file:
+        preview_path = _build_preview_file(source_path, tmp_dir, timeout=conversion_timeout)
+        with open(preview_path, "rb") as output_file:
             content = output_file.read()
 
     return {
         "content": content,
         "filename": _build_output_filename(resource),
-        "mimetype": "image/svg+xml",
+        "mimetype": PDF_MIMETYPE,
         "resource_id": resource_id,
     }
 
@@ -146,6 +127,7 @@ def _stage_resource_dwg(
     source_path = os.path.join(tmp_dir, "source.dwg")
 
     if resource.get("url_type") == "upload":
+        log.info("Preparing uploaded DWG resource=%s", resource.get("id"))
         _copy_uploaded_resource(
             resource,
             source_path,
@@ -156,6 +138,7 @@ def _stage_resource_dwg(
         resource_url = str(resource.get("url") or "").strip()
         if not resource_url:
             raise ValidationError({"resource_id": ["Resource does not have a downloadable URL"]})
+        log.info("Downloading external DWG resource=%s url=%s", resource.get("id"), resource_url)
         _download_to_path(
             resource_url,
             source_path,
@@ -167,6 +150,12 @@ def _stage_resource_dwg(
     if not os.path.exists(source_path) or os.path.getsize(source_path) == 0:
         raise ValidationError({"resource_id": ["DWG source file could not be prepared"]})
 
+    log.info(
+        "Prepared DWG source resource=%s path=%s bytes=%s",
+        resource.get("id"),
+        source_path,
+        os.path.getsize(source_path),
+    )
     return source_path
 
 
@@ -176,13 +165,6 @@ def _copy_uploaded_resource(
     max_download_bytes: int,
     download_timeout: int,
 ) -> None:
-    """
-    Resolve a CKAN-uploaded file into a temp file.
-
-    The filesystem branch matches the default CKAN storage backend. The signed
-    URL branch is an adaptation point for storage backends such as
-    ckanext-s3filestore, which this repository currently enables.
-    """
     resource_upload = uploader.get_resource_uploader(dict(resource))
     resource_id = resource["id"]
     resource_name = os.path.basename(str(resource.get("url") or "")) or f"{resource_id}.dwg"
@@ -191,17 +173,13 @@ def _copy_uploaded_resource(
     try:
         local_path = resource_upload.get_path(resource_id)
     except TypeError:
-        # Some backends, such as s3filestore, require the stored filename.
         local_path = None
     except Exception as err:
         log.debug("Failed to resolve local upload path for %s: %s", resource_id, err)
 
     if local_path and os.path.exists(local_path):
-        _copy_local_file(
-            local_path,
-            destination_path,
-            max_download_bytes=max_download_bytes,
-        )
+        log.info("Copying uploaded DWG from local storage resource=%s path=%s", resource_id, local_path)
+        _copy_local_file(local_path, destination_path, max_download_bytes=max_download_bytes)
         return
 
     if all(
@@ -212,6 +190,7 @@ def _copy_uploaded_resource(
             getattr(resource_upload, "p_key_readonly", None)
             and getattr(resource_upload, "s_key_readonly", None)
         )
+        remote_key = None
         try:
             remote_key = resource_upload.get_path(resource_id, resource_name)
             signed_url = resource_upload.get_signed_url_to_key(
@@ -219,7 +198,7 @@ def _copy_uploaded_resource(
                 read_only=use_readonly_credentials,
             )
         except Exception as err:
-            if use_readonly_credentials:
+            if use_readonly_credentials and remote_key:
                 try:
                     signed_url = resource_upload.get_signed_url_to_key(
                         remote_key,
@@ -242,6 +221,11 @@ def _copy_uploaded_resource(
                     {"resource_id": [f"Could not resolve uploaded resource: {err}"]}
                 )
 
+        log.info(
+            "Downloading uploaded DWG from remote storage resource=%s key=%s",
+            resource_id,
+            remote_key,
+        )
         _download_to_path(
             signed_url,
             destination_path,
@@ -316,279 +300,321 @@ def _download_to_path(
             os.remove(destination_path)
         raise ValidationError({"resource_id": [f"Could not download {source_label}: {err}"]})
 
-
-def _convert_dwg_to_best_svg(
-    source_path: str,
-    tmp_dir: str,
-    timeout: int,
-) -> str:
-    default_variant = _attempt_svg_conversion(
-        source_path,
-        os.path.join(tmp_dir, "preview.default.svg"),
-        timeout=timeout,
-        mspace_only=False,
-        mode_label="default",
-    )
-    mspace_variant = _attempt_svg_conversion(
-        source_path,
-        os.path.join(tmp_dir, "preview.mspace.svg"),
-        timeout=timeout,
-        mspace_only=True,
-        mode_label="mspace",
-    )
-    selected_variant = _select_best_svg_variant(default_variant, mspace_variant)
-    log.debug(
-        "DWG preview chose %s conversion (score=%s, bytes=%s, drawables=%s)",
-        selected_variant["mode"],
-        selected_variant["score"],
-        selected_variant["size_bytes"],
-        selected_variant["drawable_count"],
-    )
-    return selected_variant["path"]
-
-
-def _attempt_svg_conversion(
-    source_path: str,
-    svg_path: str,
-    timeout: int,
-    mspace_only: bool,
-    mode_label: str,
-) -> dict[str, Any]:
-    try:
-        _run_dwg_to_svg(source_path, svg_path, timeout, mspace_only=mspace_only)
-        _normalize_svg_viewbox(svg_path)
-        _enhance_svg_strokes(svg_path)
-        drawable_count, size_bytes = _measure_svg_preview(svg_path)
-        return {
-            "mode": mode_label,
-            "path": svg_path,
-            "score": drawable_count * 1000 + size_bytes,
-            "drawable_count": drawable_count,
-            "size_bytes": size_bytes,
-        }
-    except ValidationError as err:
-        log.warning("DWG preview %s conversion failed: %s", mode_label, err.error_dict)
-        return {"mode": mode_label, "error": err}
-
-
-def _select_best_svg_variant(*variants: dict[str, Any]) -> dict[str, Any]:
-    successful_variants = [variant for variant in variants if "error" not in variant]
-    if successful_variants:
-        return max(
-            successful_variants,
-            key=lambda variant: (
-                variant["score"],
-                variant["drawable_count"],
-                variant["size_bytes"],
-            ),
-        )
-
-    error_messages = []
-    for variant in variants:
-        error = variant.get("error")
-        if not error:
-            continue
-        error_messages.append(f'{variant["mode"]}: {error.error_dict}')
-
-    raise ValidationError(
-        {
-            "conversion": [
-                "DWG conversion failed for all modes"
-                + (f" ({'; '.join(error_messages)})" if error_messages else "")
-            ]
-        }
+    log.info(
+        "Downloaded %s path=%s bytes=%s",
+        source_label,
+        destination_path,
+        bytes_downloaded,
     )
 
 
-def _measure_svg_preview(svg_path: str) -> tuple[int, int]:
-    try:
-        with open(svg_path, "r", encoding="utf-8") as svg_file:
-            svg_text = svg_file.read()
-    except OSError as err:
-        raise ValidationError({"conversion": [f"Could not read generated SVG: {err}"]})
-
-    drawable_count = len(SVG_DRAWABLE_TAG_RE.findall(svg_text))
-    size_bytes = len(svg_text.encode("utf-8"))
-    return drawable_count, size_bytes
+def _build_preview_file(source_path: str, tmp_dir: str, timeout: int) -> str:
+    dxf_path = _convert_dwg_to_dxf(source_path, tmp_dir, timeout=timeout)
+    document = _load_dxf_document(dxf_path)
+    preview_path = _render_best_layout_preview(document, tmp_dir)
+    log.info("DWG preview generated format=pdf path=%s bytes=%s", preview_path, os.path.getsize(preview_path))
+    return preview_path
 
 
-def _run_dwg_to_svg(
-    source_path: str,
-    svg_path: str,
-    timeout: int,
-    mspace_only: bool = False,
-) -> None:
-    _require_command("dwg2SVG", "libredwg-tools")
-    command = ["dwg2SVG"]
-    if mspace_only:
-        command.append("--mspace")
-    command.append(source_path)
-    with open(svg_path, "wb") as svg_file:
-        result = _run_subprocess(
-            command,
-            stdout=svg_file,
-            timeout=timeout,
-        )
+def _convert_dwg_to_dxf(source_path: str, tmp_dir: str, timeout: int) -> str:
+    executable = _resolve_oda_executable()
+    output_version = str(
+        toolkit.config.get("ckanext.malmo.dwg_preview_oda_output_version")
+        or DEFAULT_ODA_OUTPUT_VERSION
+    ).strip() or DEFAULT_ODA_OUTPUT_VERSION
 
-    if result.returncode != 0 or not os.path.exists(svg_path) or os.path.getsize(svg_path) == 0:
-        stderr = _decode_subprocess_output(result.stderr)
+    input_dir = os.path.join(tmp_dir, "oda-input")
+    output_dir = os.path.join(tmp_dir, "oda-output")
+    os.makedirs(input_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+
+    input_name = os.path.basename(source_path)
+    staged_input_path = os.path.join(input_dir, input_name)
+    shutil.copyfile(source_path, staged_input_path)
+
+    command = _build_oda_command([
+        executable,
+        input_dir,
+        output_dir,
+        output_version,
+        "DXF",
+        "0",
+        "1",
+        "*.dwg",
+    ])
+    log.info("Running ODA File Converter command=%s", command)
+    result = _run_subprocess(command, timeout=timeout)
+    stderr = _decode_subprocess_output(result.stderr)
+    stdout = _decode_subprocess_output(result.stdout)
+    log.info(
+        "ODA File Converter finished code=%s stdout=%s stderr=%s",
+        result.returncode,
+        stdout or "<empty>",
+        stderr or "<empty>",
+    )
+
+    if result.returncode != 0:
         raise ValidationError(
             {
                 "conversion": [
-                    "DWG to SVG conversion failed"
+                    "DWG to DXF conversion failed"
                     + (f": {stderr}" if stderr else "")
                 ]
             }
         )
 
+    dxf_path = _find_generated_dxf(output_dir, input_name)
+    if not dxf_path or not os.path.exists(dxf_path) or os.path.getsize(dxf_path) == 0:
+        raise ValidationError(
+            {"conversion": ["DWG to DXF conversion did not produce a usable DXF file"]}
+        )
 
-def _enhance_svg_strokes(svg_path: str) -> None:
-    min_stroke_width = _get_float_config(
-        "ckanext.malmo.dwg_preview_stroke_min_width",
-        DEFAULT_STROKE_MIN_WIDTH,
-    )
-    stroke_color = str(
-        toolkit.config.get("ckanext.malmo.dwg_preview_stroke_color") or DEFAULT_STROKE_COLOR
-    ).strip() or DEFAULT_STROKE_COLOR
-    stroke_opacity = _get_float_config(
-        "ckanext.malmo.dwg_preview_stroke_opacity",
-        DEFAULT_STROKE_OPACITY,
-    )
+    log.info("Generated DXF path=%s bytes=%s", dxf_path, os.path.getsize(dxf_path))
+    return dxf_path
 
-    min_stroke_width = max(0.1, min_stroke_width)
-    stroke_opacity = min(max(0.0, stroke_opacity), 1.0)
+
+def _build_oda_command(oda_arguments: list[str]) -> list[str]:
+    xvfb_run = shutil.which("xvfb-run")
+    if not xvfb_run:
+        return oda_arguments
+
+    screen_spec = str(
+        toolkit.config.get("ckanext.malmo.dwg_preview_xvfb_screen")
+        or "-screen 0 1024x768x24"
+    ).strip() or "-screen 0 1024x768x24"
+    return [xvfb_run, "-a", "-s", screen_spec, *oda_arguments]
+
+
+def _find_generated_dxf(output_dir: str, input_name: str) -> str | None:
+    expected_name = os.path.splitext(input_name)[0] + ".dxf"
+    expected_path = os.path.join(output_dir, expected_name)
+    if os.path.exists(expected_path):
+        return expected_path
+
+    for root, _dirs, files in os.walk(output_dir):
+        for file_name in files:
+            if file_name.lower().endswith(".dxf"):
+                return os.path.join(root, file_name)
+    return None
+
+
+def _load_dxf_document(dxf_path: str) -> Any:
+    try:
+        import ezdxf
+        from ezdxf import recover
+    except ImportError as err:
+        raise ValidationError(
+            {"converter": [f"DXF renderer dependency is not installed: {err}"]}
+        )
 
     try:
-        with open(svg_path, "r", encoding="utf-8") as svg_file:
-            svg_text = svg_file.read()
-    except OSError as err:
-        raise ValidationError({"conversion": [f"Could not read generated SVG: {err}"]})
+        document = ezdxf.readfile(dxf_path)
+        log.info("Loaded DXF document path=%s using fast read path", dxf_path)
+        return document
+    except Exception as fast_err:
+        log.warning("Fast DXF load failed for %s, retrying recovery path: %s", dxf_path, fast_err)
 
-    style_block = (
-        "<style id=\"ckan-dwg-preview-stroke-style\">"
-        ".ckan-dwg-preview-scope path,"
-        ".ckan-dwg-preview-scope line,"
-        ".ckan-dwg-preview-scope polyline,"
-        ".ckan-dwg-preview-scope polygon,"
-        ".ckan-dwg-preview-scope circle,"
-        ".ckan-dwg-preview-scope ellipse,"
-        ".ckan-dwg-preview-scope use{"
-        f"stroke:{stroke_color} !important;"
-        f"stroke-width:{min_stroke_width}px !important;"
-        "vector-effect:non-scaling-stroke !important;"
-        "stroke-linecap:round;"
-        "stroke-linejoin:round;"
-        f"stroke-opacity:{stroke_opacity} !important;"
-        "}"
-        "</style>"
+    try:
+        document, auditor = recover.readfile(dxf_path)
+    except Exception as err:
+        raise ValidationError({"conversion": [f"Generated DXF could not be parsed: {err}"]})
+
+    error_count = len(getattr(auditor, "errors", []))
+    fixed_error_count = len(getattr(auditor, "fixes", []))
+    log.info(
+        "Loaded DXF document path=%s auditor_errors=%s auditor_fixes=%s",
+        dxf_path,
+        error_count,
+        fixed_error_count,
+    )
+    return document
+
+
+def _render_best_layout_preview(document: Any, tmp_dir: str) -> str:
+    failed_errors: list[ValidationError] = []
+    failed_layouts: list[str] = []
+
+    for layout_name, layout_kind, layout, entity_count in _iter_layout_candidates(document):
+        try:
+            _guard_preview_complexity(layout_name, layout_kind, entity_count)
+            return _render_layout_preview(document, layout, layout_name, entity_count, tmp_dir)
+        except ValidationError as err:
+            failed_errors.append(err)
+            failed_layouts.append(f"{layout_name}: {err.error_dict}")
+            log.warning("DWG preview layout render failed layout=%s kind=%s entities=%s error=%s", layout_name, layout_kind, entity_count, err.error_dict)
+
+    if len(failed_errors) == 1:
+        raise failed_errors[0]
+
+    raise ValidationError(
+        {
+            "conversion": [
+                "Preview is currently unavailable for this drawing."
+            ],
+            "preview_reason": ["preview_unavailable"],
+        }
     )
 
-    normalized_svg = svg_text
 
-    if "ckan-dwg-preview-scope" not in normalized_svg:
-        root_tag_match = SVG_ROOT_TAG_RE.search(normalized_svg)
-        if root_tag_match:
-            root_tag = root_tag_match.group(0)
-            if "class=" in root_tag:
-                scoped_root = re.sub(
-                    r'class="([^"]*)"',
-                    r'class="\1 ckan-dwg-preview-scope"',
-                    root_tag,
-                    count=1,
-                    flags=re.IGNORECASE,
-                )
-            else:
-                scoped_root = root_tag[:-1] + ' class="ckan-dwg-preview-scope">'
-            start, end = root_tag_match.span()
-            normalized_svg = normalized_svg[:start] + scoped_root + normalized_svg[end:]
+def _iter_layout_candidates(document: Any) -> list[tuple[str, str, Any, int]]:
+    candidates: list[tuple[str, str, Any, int]] = []
 
-    if "ckan-dwg-preview-stroke-style" not in normalized_svg:
-        defs_close_match = SVG_DEFS_CLOSE_RE.search(normalized_svg)
-        if defs_close_match:
-            insert_at = defs_close_match.end()
-            normalized_svg = normalized_svg[:insert_at] + style_block + normalized_svg[insert_at:]
-        else:
-            root_tag_match = SVG_ROOT_TAG_RE.search(normalized_svg)
-            if root_tag_match:
-                insert_at = root_tag_match.end()
-                normalized_svg = normalized_svg[:insert_at] + style_block + normalized_svg[insert_at:]
+    layout_names_method = getattr(document, "layout_names_in_taborder", None)
+    modelspace_name = str(getattr(document.modelspace(), "name", "Model"))
+    if callable(layout_names_method):
+        for layout_name in list(layout_names_method()):
+            if str(layout_name).lower() == modelspace_name.lower():
+                continue
+            try:
+                layout = document.paperspace(layout_name)
+            except Exception as err:
+                log.warning("Skipping paperspace layout=%s because it could not be loaded: %s", layout_name, err)
+                continue
+            entity_count = _count_layout_entities(layout)
+            log.info("Found paperspace layout=%s entities=%s", layout_name, entity_count)
+            if entity_count > 0:
+                candidates.append((str(layout_name), "paperspace", layout, entity_count))
 
-    if normalized_svg == svg_text:
+    modelspace = document.modelspace()
+    modelspace_entity_count = _count_layout_entities(modelspace)
+    log.info("Found modelspace layout=%s entities=%s", getattr(modelspace, "name", "Model"), modelspace_entity_count)
+    candidates.append((getattr(modelspace, "name", "Model"), "modelspace", modelspace, modelspace_entity_count))
+    return candidates
+
+
+def _render_layout_preview(document: Any, layout: Any, layout_name: str, entity_count: int, tmp_dir: str) -> str:
+    if entity_count <= 0:
+        raise ValidationError(
+            {"conversion": [f'Layout "{layout_name}" does not contain drawable entities']}
+        )
+
+    preview_path = os.path.join(
+        tmp_dir,
+        f"preview.{_sanitize_filename_component(layout_name)}.{PDF_EXTENSION}",
+    )
+    log.info("Rendering DXF layout=%s entities=%s target=%s", layout_name, entity_count, preview_path)
+    _render_layout_to_pdf(document, layout, preview_path)
+    _validate_rendered_preview(preview_path, layout_name)
+    log.info("Rendered preview accepted layout=%s bytes=%s", layout_name, os.path.getsize(preview_path))
+    return preview_path
+
+
+def _render_layout_to_pdf(document: Any, layout: Any, output_path: str) -> None:
+    try:
+        from ezdxf.addons.drawing import Frontend, RenderContext, layout as drawing_layout, pymupdf
+    except ImportError as err:
+        raise ValidationError(
+            {"converter": [f"PDF rendering dependency is not installed: {err}"]}
+        )
+
+    margin_mm = max(
+        0.0,
+        _get_float_config("ckanext.malmo.dwg_preview_render_margin_mm", DEFAULT_RENDER_MARGIN_MM),
+    )
+
+    try:
+        context = RenderContext(document)
+        backend = pymupdf.PyMuPdfBackend()
+        frontend = Frontend(context, backend)
+        frontend.draw_layout(layout, finalize=True)
+        page = _build_preview_page(drawing_layout, margin_mm)
+        pdf_bytes = backend.get_pdf_bytes(page)
+        with open(output_path, "wb") as output_file:
+            output_file.write(pdf_bytes)
+    except Exception as err:
+        raise ValidationError(
+            {
+                "conversion": [
+                    f'DXF PDF rendering failed for layout "{getattr(layout, "name", "unknown")}": {err}'
+                ]
+            }
+        )
+
+
+def _build_preview_page(drawing_layout: Any, margin_mm: float) -> Any:
+    page_size_mm = max(
+        50.0,
+        _get_float_config(
+            "ckanext.malmo.dwg_preview_render_page_size_mm",
+            DEFAULT_RENDER_PAGE_SIZE_MM,
+        ),
+    )
+    return drawing_layout.Page(
+        page_size_mm,
+        page_size_mm,
+        drawing_layout.Units.mm,
+        margins=drawing_layout.Margins.all(margin_mm),
+    )
+
+
+def _validate_rendered_preview(preview_path: str, layout_name: str) -> None:
+    if not os.path.exists(preview_path) or os.path.getsize(preview_path) == 0:
+        raise ValidationError(
+            {"conversion": [f'Renderer produced no output for layout "{layout_name}"']}
+        )
+
+    minimum_size_bytes = _get_int_config(
+        "ckanext.malmo.dwg_preview_min_preview_bytes",
+        DEFAULT_MIN_PREVIEW_BYTES,
+    )
+    if os.path.getsize(preview_path) < minimum_size_bytes:
+        raise ValidationError(
+            {"conversion": [f'Rendered preview for layout "{layout_name}" is too small to be trustworthy']}
+        )
+
+
+def _guard_preview_complexity(layout_name: str, layout_kind: str, entity_count: int) -> None:
+    if layout_kind != "modelspace":
         return
 
-    try:
-        with open(svg_path, "w", encoding="utf-8") as svg_file:
-            svg_file.write(normalized_svg)
-    except OSError as err:
-        raise ValidationError({"conversion": [f"Could not normalize generated SVG: {err}"]})
-
-
-def _normalize_svg_viewbox(svg_path: str) -> None:
-    """
-    Rebase libredwg SVG output when the viewBox origin is left in world coords.
-
-    Some DWG files are emitted with a large absolute viewBox origin while the
-    visible geometry is already shifted near 0,0. That mismatch causes
-    rasterization to render an empty transparent image.
-    """
-    try:
-        with open(svg_path, "r", encoding="utf-8") as svg_file:
-            svg_text = svg_file.read()
-    except OSError as err:
-        raise ValidationError({"conversion": [f"Could not read generated SVG: {err}"]})
-
-    match = SVG_VIEWBOX_RE.search(svg_text)
-    if not match:
-        return
-
-    min_x = float(match.group("min_x"))
-    min_y = float(match.group("min_y"))
-    width = match.group("width")
-    height = match.group("height")
-    normalized_svg = svg_text
-
-    if min_x != 0 or min_y != 0:
-        normalized_viewbox = f'viewBox="0 0 {width} {height}"'
-        normalized_svg = SVG_VIEWBOX_RE.sub(normalized_viewbox, normalized_svg, count=1)
-
-    normalized_svg = _normalize_svg_root_size(normalized_svg, width=width, height=height)
-
-    if normalized_svg == svg_text:
-        return
-
-    try:
-        with open(svg_path, "w", encoding="utf-8") as svg_file:
-            svg_file.write(normalized_svg)
-    except OSError as err:
-        raise ValidationError({"conversion": [f"Could not normalize generated SVG: {err}"]})
-
-
-def _normalize_svg_root_size(svg_text: str, width: str, height: str) -> str:
-    """
-    Ensure generated SVGs have intrinsic dimensions when embedded as images.
-
-    libredwg emits root SVG tags with width/height set to 100%, which renders
-    fine in a browser tab but can collapse or scale unpredictably when the SVG
-    is used as an <img> source. Replacing those root dimensions with concrete
-    values derived from the viewBox gives the browser a stable intrinsic size.
-    """
-    root_tag_match = SVG_ROOT_TAG_RE.search(svg_text)
-    if not root_tag_match:
-        return svg_text
-
-    root_tag = root_tag_match.group(0)
-    normalized_root_tag = SVG_WIDTH_ATTR_RE.sub(f'width="{width}"', root_tag, count=1)
-    normalized_root_tag = SVG_HEIGHT_ATTR_RE.sub(
-        f'height="{height}"',
-        normalized_root_tag,
-        count=1,
+    max_modelspace_entities = _get_int_config(
+        "ckanext.malmo.dwg_preview_max_modelspace_entities",
+        DEFAULT_MAX_MODELSPACE_ENTITIES,
     )
+    if entity_count > max_modelspace_entities:
+        raise ValidationError(
+            {
+                "conversion": [
+                    "This drawing is too detailed to preview here."
+                ],
+                "preview_reason": ["modelspace_too_complex"],
+            }
+        )
 
-    if normalized_root_tag == root_tag:
-        return svg_text
 
-    start, end = root_tag_match.span()
-    return svg_text[:start] + normalized_root_tag + svg_text[end:]
+def _count_layout_entities(layout: Any) -> int:
+    try:
+        return sum(1 for _entity in layout)
+    except TypeError:
+        return len(list(layout))
+
+
+def _resolve_oda_executable() -> str:
+    configured_path = str(
+        toolkit.config.get("ckanext.malmo.dwg_preview_oda_executable") or "ODAFileConverter"
+    ).strip() or "ODAFileConverter"
+    if os.path.isabs(configured_path):
+        if os.path.exists(configured_path) and os.access(configured_path, os.X_OK):
+            return configured_path
+        raise ValidationError(
+            {
+                "converter": [
+                    f'Configured ODA File Converter is not executable: "{configured_path}"'
+                ]
+            }
+        )
+
+    resolved = shutil.which(configured_path)
+    if resolved:
+        return resolved
+
+    raise ValidationError(
+        {
+            "converter": [
+                'ODA File Converter is not installed. Configure `ckanext.malmo.dwg_preview_oda_executable` or add `ODAFileConverter` to PATH.'
+            ]
+        }
+    )
 
 
 def _run_subprocess(
@@ -613,18 +639,6 @@ def _run_subprocess(
         raise ValidationError({"conversion": [f"Conversion process failed to start: {err}"]})
 
 
-def _require_command(command_name: str, package_name: str) -> None:
-    if shutil.which(command_name):
-        return
-    raise ValidationError(
-        {
-            "converter": [
-                f'{command_name} is not installed. Install the "{package_name}" package.'
-            ]
-        }
-    )
-
-
 def _decode_subprocess_output(output: bytes | None) -> str:
     if not output:
         return ""
@@ -638,7 +652,12 @@ def _build_output_filename(resource: dict[str, Any]) -> str:
         or resource["id"]
     )
     base_name = os.path.splitext(raw_name)[0] or resource["id"]
-    return f"{base_name}.svg"
+    return f"{base_name}.{PDF_EXTENSION}"
+
+
+def _sanitize_filename_component(value: str) -> str:
+    sanitized = "".join(char if char.isalnum() or char in "._-" else "-" for char in value).strip("-")
+    return sanitized or "layout"
 
 
 def _get_int_config(config_key: str, default_value: int) -> int:
@@ -648,7 +667,7 @@ def _get_int_config(config_key: str, default_value: int) -> int:
     try:
         return int(raw_value)
     except (TypeError, ValueError):
-        log.warning("Invalid integer config for %s=%r, using default %s", config_key, raw_value, default_value)
+        log.warning("Invalid integer config %s=%r, using default %s", config_key, raw_value, default_value)
         return default_value
 
 
@@ -659,10 +678,5 @@ def _get_float_config(config_key: str, default_value: float) -> float:
     try:
         return float(raw_value)
     except (TypeError, ValueError):
-        log.warning(
-            "Invalid float config for %s=%r, using default %s",
-            config_key,
-            raw_value,
-            default_value,
-        )
+        log.warning("Invalid float config %s=%r, using default %s", config_key, raw_value, default_value)
         return default_value

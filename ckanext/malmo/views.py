@@ -23,7 +23,7 @@ def dwg_preview_convert() -> flask.Response:
     Binary endpoint that mirrors an action URL.
 
     CKAN 2.11 wraps normal action responses in JSON, so this blueprint exposes
-    the same action name as a concrete Flask route and returns the image bytes
+    the same action name as a concrete Flask route and returns the preview bytes
     directly.
     """
     data_dict = _get_request_data()

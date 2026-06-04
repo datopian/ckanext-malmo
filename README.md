@@ -1,6 +1,6 @@
 # ckanext-malmo
 
-Customizations for the City of Malmö CKAN instance.
+Customizations for the City of Malm? CKAN instance.
 
 ## Requirements
 
@@ -8,26 +8,37 @@ Customizations for the City of Malmö CKAN instance.
 
 ## DWG Preview Requirements
 
-This extension includes a DWG preview endpoint that converts DWG resources to SVG for browser preview.
+This extension includes a DWG preview endpoint that converts DWG resources into browser-previewable PDFs.
 
 Important:
-- `dwg2SVG` is required at runtime
-- `dwg2SVG` is provided by LibreDWG
-- this is a system dependency, not a Python package dependency
+- ODA File Converter is required at runtime for DWG -> DXF conversion
+- Python rendering dependencies are required at runtime for DXF -> PDF rendering
+- these are runtime dependencies, not just Python package dependencies
 
-That means installing the extension with `pip` is not enough by itself. The CKAN environment that runs this extension must also have LibreDWG installed and available on `PATH`.
+The preview pipeline is:
+1. stage the DWG resource into a temporary file
+2. convert DWG -> DXF with ODA File Converter
+3. render DXF -> PDF
+4. return the generated PDF through the existing CKAN action and endpoint
 
-In the local Docker-based development setup, LibreDWG is installed in the CKAN image build.
+That means installing the extension with `pip` is not enough by itself. The CKAN environment that runs this extension must also have ODA File Converter installed and available on `PATH`.
 
-Tested runtime dependency:
-- LibreDWG / `dwg2SVG` 0.13.x
+In the local Docker-based development setup, the CKAN image installs ODA File Converter automatically from the official ODA Linux AppImage by default. You can also override that by placing an official asset in `ckan/vendor/oda/`.
+
+Python runtime dependencies:
+- `ezdxf`
+- `PyMuPDF`
+
+System/runtime dependencies:
+- ODA File Converter Linux asset (`.AppImage` or `.deb`)
+- `xvfb` for headless execution of ODA File Converter when the Linux build only exposes the Qt `xcb` plugin
 
 ## DWG Preview Configuration
 
 The DWG preview code supports these CKAN config settings:
 
 - `ckanext.malmo.dwg_preview_timeout`
-  Conversion timeout in seconds.
+  Conversion timeout in seconds. Default: `45`.
 
 - `ckanext.malmo.dwg_preview_download_timeout`
   Download timeout in seconds for remote DWG resources.
@@ -35,16 +46,53 @@ The DWG preview code supports these CKAN config settings:
 - `ckanext.malmo.dwg_preview_max_download_bytes`
   Maximum DWG download size in bytes.
 
-- `ckanext.malmo.dwg_preview_stroke_min_width`
-  Minimum stroke width (in px) enforced on generated SVG previews. Default: `1.4`.
+- `ckanext.malmo.dwg_preview_oda_executable`
+  Absolute path or executable name for ODA File Converter. Default: `ODAFileConverter`.
 
-- `ckanext.malmo.dwg_preview_stroke_color`
-  Stroke color enforced on generated SVG previews. Default: `#111111`.
+- `ckanext.malmo.dwg_preview_oda_output_version`
+  DXF target version passed to ODA File Converter. Default: `ACAD2018`.
 
-- `ckanext.malmo.dwg_preview_stroke_opacity`
-  Stroke opacity enforced on generated SVG previews. Range: `0.0` to `1.0`. Default: `1.0`.
+- `ckanext.malmo.dwg_preview_render_margin_mm`
+  Extra page margin applied around rendered geometry to avoid edge clipping in previews. Default: `4`.
+
+- `ckanext.malmo.dwg_preview_render_page_size_mm`
+  Fixed square page size used for generated previews so large drawings are scaled down into a browser-friendly PDF. Default: `160`.
+
+- `ckanext.malmo.dwg_preview_xvfb_screen`
+  Screen configuration passed to `xvfb-run` when launching ODA File Converter in headless Docker environments. Default: `-screen 0 1024x768x24`.
+
+- `ckanext.malmo.dwg_preview_min_preview_bytes`
+  Minimum byte size for accepting a generated preview. Default: `1024`.
+
+- `ckanext.malmo.dwg_preview_max_modelspace_entities`
+  Maximum entity count allowed for a modelspace-only inline preview. Files above this limit fail fast with a download-first message. Default: `5000`.
 
 If these settings are not provided, the extension uses built-in defaults.
+
+## Docker Setup
+
+By default, the Docker image downloads the ODA File Converter Linux AppImage from the official ODA site during build.
+
+Optional local override directory:
+
+```text
+ckan/vendor/oda/
+```
+
+Supported local asset formats:
+- `.AppImage`
+- `.deb`
+
+Default configured asset name:
+
+```text
+ODAFileConverter_QT6_lnxX64_8.3dll_27.1.AppImage
+```
+
+Build resolution order:
+1. use the file named by `ODA_FILE_CONVERTER_ASSET` if it exists in `ckan/vendor/oda/`
+2. otherwise download that filename from the official ODA site
+3. if `ODA_FILE_CONVERTER_ASSET` is empty, discover the current AppImage filename from the official ODA catalog page and download it
 
 ## Installation
 
@@ -55,7 +103,7 @@ To install `ckanext-malmo`:
    ```bash
    pip install -e ckan/extensions/ckanext-malmo
    ```
-3. Make sure LibreDWG / `dwg2SVG` is installed in the runtime environment.
+3. Install ODA File Converter and make sure `ODAFileConverter` is available in the runtime environment.
 4. Add `malmo` to the `ckan.plugins` setting in your CKAN configuration file (`ckan.ini`):
    ```ini
    ckan.plugins = ... malmo
