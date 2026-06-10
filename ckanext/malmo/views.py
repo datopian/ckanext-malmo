@@ -17,8 +17,8 @@ dwg_preview_blueprint = flask.Blueprint("malmo_dwg_preview", __name__)
 ValidationError = logic.ValidationError
 
 
-@dwg_preview_blueprint.route("/api/3/action/dwg_preview_convert", methods=["GET", "POST"])
-def dwg_preview_convert() -> flask.Response:
+@dwg_preview_blueprint.route("/api/3/action/convert_dwg", methods=["GET", "POST"])
+def convert_dwg() -> flask.Response:
     """
     Binary endpoint that mirrors an action URL.
 
@@ -30,7 +30,7 @@ def dwg_preview_convert() -> flask.Response:
     context = _build_context()
 
     try:
-        payload = toolkit.get_action("dwg_preview_convert")(context, data_dict)
+        payload = toolkit.get_action("convert_dwg")(context, data_dict)
     except ValidationError as err:
         return _validation_error_response(err)
     except Exception:
@@ -98,6 +98,6 @@ def _help_url() -> str:
         "api.action",
         logic_function="help_show",
         ver=3,
-        name="dwg_preview_convert",
+        name="convert_dwg",
         _external=True,
     )

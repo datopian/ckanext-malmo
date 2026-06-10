@@ -1,4 +1,5 @@
 html2text
 requests
 ezdxf
-PyMuPDF
+matplotlib
+Pillow

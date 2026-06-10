@@ -18,7 +18,8 @@ setup(
         'html2text',
         'requests',
         'ezdxf',
-        'PyMuPDF',
+        'matplotlib',
+        'Pillow',
     ],
     entry_points='''
         [ckan.plugins]

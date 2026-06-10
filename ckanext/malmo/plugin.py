@@ -24,7 +24,7 @@ class MalmoPlugin(plugins.SingletonPlugin):
 
     def get_actions(self):
         return {
-            'dwg_preview_convert': malmo_logic_actions.dwg_preview_convert,
+            'convert_dwg': malmo_logic_actions.convert_dwg,
             'package_update': malmo_actions.package_update,
             'package_create': malmo_actions.package_create,
             'package_patch': malmo_actions.package_patch,
