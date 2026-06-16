@@ -15,7 +15,11 @@ setup(
     include_package_data=True,
     zip_safe=False,
     install_requires=[
-        # list of dependencies
+        'html2text',
+        'requests',
+        'ezdxf',
+        'matplotlib',
+        'Pillow',
     ],
     entry_points='''
         [ckan.plugins]
