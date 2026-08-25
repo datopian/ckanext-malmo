@@ -321,7 +321,11 @@ def package_search(next_action, context, data_dict):
 
     # Process search result items
     for package_dict in search_results.get("results", []):
-        org_id = package_dict.get("organization", {}).get("id")
+        # .get(..., {}) only supplies the {} default when the key is
+        # missing entirely - a dataset with no organization (e.g. its org
+        # was deleted, or it was never assigned one) has the key present
+        # with value None, which crashed every search page this was hit on.
+        org_id = (package_dict.get("organization") or {}).get("id")
 
         if org_id in translations_by_id:
             package_dict["organization"].update(translations_by_id[org_id])
@@ -329,7 +333,7 @@ def package_search(next_action, context, data_dict):
                 translations_by_id[org_id].get("title_translated")
             )
 
-        for group_dict in package_dict.get("groups", []):
+        for group_dict in package_dict.get("groups") or []:
             group_id = group_dict.get("id")
 
             if group_id in translations_by_id:
