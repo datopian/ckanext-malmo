@@ -74,16 +74,38 @@ def _get_all_group_translations(model):
 
     This bulk fetch is used to avoid N+1 query performance issues during
     search and list operations.
+
+    CKAN 2.12 removed the group_extra table (and the GroupExtra model):
+    extras are now a JSONB column on the group table. CKAN 2.11 and older
+    still use the GroupExtra model, so both storage formats are supported.
     """
-    from ckan.model import GroupExtra
+    translation_mapping = {}
+    GroupExtra = getattr(model, "GroupExtra", None)
+
+    if GroupExtra is None:
+        group_rows = (
+            model.Session.query(model.Group.id, model.Group.extras)
+            .filter(model.Group.extras.isnot(None))
+            .all()
+        )
+
+        for group_id, extras in group_rows:
+            translated = {
+                key: value
+                for key, value in (extras or {}).items()
+                if "_translated" in key
+            }
+
+            if translated:
+                translation_mapping[group_id] = translated
+
+        return translation_mapping
 
     translation_extras = (
         model.Session.query(GroupExtra)
         .filter(GroupExtra.key.contains("_translated"))
         .all()
     )
-
-    translation_mapping = {}
 
     for extra in translation_extras:
         if extra.group_id not in translation_mapping:
